@@ -11,6 +11,10 @@ class WebBluetoothService implements BluetoothServiceInterface {
   final _receivedDataController = StreamController<String>.broadcast();
   final _connectedDeviceController = StreamController<dynamic>.broadcast();
 
+  // Command queue system
+  final List<_BluetoothCommand> _commandQueue = [];
+  bool _processingCommand = false;
+  
   // Public streams
   @override
   Stream<List<dynamic>> get devicesStream => _devicesController.stream;
@@ -202,9 +206,6 @@ class WebBluetoothService implements BluetoothServiceInterface {
       _updateConnectionStatus(connected ? "Connected" : "Partial connection");
       _connectedDeviceController.add(_device);
       
-      // Bắt đầu cơ chế tự kết nối lại định kỳ
-      _startReconnectionTimer();
-
       // Thêm sự kiện lắng nghe mất kết nối
       _setupDisconnectionListener();
       
@@ -337,6 +338,56 @@ class WebBluetoothService implements BluetoothServiceInterface {
     }
     
     if (_isConnected) {
+      // Add to command queue with priority for ST commands
+      final completer = Completer<bool>();
+      final command = _BluetoothCommand(message, completer);
+      
+      // If this is a stop command, clear all other movement commands and prioritize this one
+      if (message.trim() == "ST") {
+        // Remove any pending movement commands (FW, BW, TR, TL, etc.) from queue
+        _commandQueue.removeWhere((cmd) => 
+          cmd.message.trim() == "FW" || 
+          cmd.message.trim() == "BW" || 
+          cmd.message.trim() == "TR" ||
+          cmd.message.trim() == "TL" ||
+          cmd.message.contains("VR") ||
+          cmd.message.contains("VL")
+        );
+        
+        // Add the stop command to the front
+        _commandQueue.insert(0, command);
+        print("📝 STOP command prioritized and movement commands cleared from queue");
+      } else {
+        _commandQueue.add(command);
+        print("📝 Command added to queue: $message");
+      }
+      
+      // Start processing queue if not already processing
+      if (!_processingCommand) {
+        _processCommandQueue();
+      }
+      
+      // Return the future that will complete when this command is processed
+      return completer.future;
+    } else {
+      print("❌ Không có kết nối");
+      return false;
+    }
+  }
+  
+  // Process commands in the queue one by one
+  Future<void> _processCommandQueue() async {
+    if (_processingCommand || _commandQueue.isEmpty) return;
+    
+    _processingCommand = true;
+    
+    while (_commandQueue.isNotEmpty) {
+      final command = _commandQueue.removeAt(0);
+      final message = command.message;
+      final completer = command.completer;
+      
+      print("🔄 Processing queued command: $message");
+      
       // Tạo bytes để gửi với tiền tố 0x15
       final bytes = utf8.encode(message);
       final fullPacket = [0x15, ...bytes]; // Add same prefix as in native implementation
@@ -358,7 +409,7 @@ class WebBluetoothService implements BluetoothServiceInterface {
               print("📤 Đang gửi command: $message");
             }
             
-            // Tạo Uint8Array từ dữ liệu - Đây là phần có lỗi
+            // Tạo Uint8Array từ dữ liệu
             final array = js.JsObject.jsify(fullPacket);
             // Sử dụng constructor đúng cách với new
             final uint8Array = js.JsObject(js.context['Uint8Array'], [array]);
@@ -368,6 +419,9 @@ class WebBluetoothService implements BluetoothServiceInterface {
             
             print("✅ Đã gửi thành công command: $message");
             success = true;
+            
+            // Add a small delay between commands to let the GATT operation complete
+            await Future.delayed(const Duration(milliseconds: 100));
           } catch (e) {
             print("⚠️ Lỗi khi gửi command (lần ${retryCount + 1}): $e");
             
@@ -381,34 +435,37 @@ class WebBluetoothService implements BluetoothServiceInterface {
                 print("Đã kết nối lại thành công, tiếp tục gửi command");
               } else {
                 print("Kết nối lại thất bại");
-                // Lên lịch một lần kết nối lại sau
+                // Try to reconnect
                 _tryReconnect();
               }
+            }
+            
+            // Add larger delay if there was an error (especially GATT operation in progress)
+            if (e.toString().contains('GATT operation already in progress')) {
+              await Future.delayed(const Duration(milliseconds: 500));
             }
             
             retryCount++;
           }
         }
         
-        // Trên web, chúng ta coi là thành công nếu vẫn còn kết nối
-        // nhưng hãy ghi log để dễ debug
+        // Complete the future for this command
+        completer.complete(success || _isConnected);
+        
         if (!success) {
           print("⚠️ Đã thử gửi $maxRetries lần nhưng thất bại: $message");
         }
-        
-        return success || _isConnected;
       } else {
         // Nếu không có rxCharacteristic, chúng ta thử kết nối lại
         print("📤 Không tìm thấy đặc tính RX, đang thử kết nối lại...");
         _tryReconnect();
         
-        // Trên web, chúng ta vẫn trả về true nếu vẫn đang kết nối
-        return _isConnected;
+        // Complete with current connection status
+        completer.complete(_isConnected);
       }
-    } else {
-      print("❌ Không có kết nối");
-      return false;
     }
+    
+    _processingCommand = false;
   }
   
   @override
@@ -479,14 +536,6 @@ class WebBluetoothService implements BluetoothServiceInterface {
     _tryReconnect();
   }
   
-  // Thiết lập cơ chế kết nối lại định kỳ
-  void _startReconnectionTimer() {
-    _reconnectionTimer?.cancel();
-    _reconnectionTimer = Timer.periodic(const Duration(seconds: 20), (_) {
-      _tryReconnect();
-    });
-  }
-  
   // Hàm thử kết nối lại
   Future<void> _tryReconnect() async {
     if (_reconnectionInProgress || _device == null || !_isConnected) return;
@@ -505,4 +554,12 @@ class WebBluetoothService implements BluetoothServiceInterface {
       _reconnectionInProgress = false;
     }
   }
+}
+
+// Helper class for command queue management
+class _BluetoothCommand {
+  final String message;
+  final Completer<bool> completer;
+  
+  _BluetoothCommand(this.message, this.completer);
 } 
